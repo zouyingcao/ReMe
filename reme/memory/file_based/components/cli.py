@@ -1,54 +1,48 @@
 """CLI component for interactive chat using agentscope-based memory tools."""
 
 import asyncio
+import os
+import subprocess
+import tempfile
+import shutil
 from datetime import datetime
 from pathlib import Path
 
 from agentscope.agent import ReActAgent
 from agentscope.message import Msg, TextBlock
 from agentscope.pipeline import stream_printing_messages
-from agentscope.tool import Toolkit, ToolResponse
+from agentscope.tool import execute_python_code, Toolkit, ToolResponse
 from loguru import logger
 
 from .compactor import Compactor
 from .context_checker import ContextChecker
 from .summarizer import Summarizer
-from ..tools import FileIO, MemorySearch
+from ..tools import browser_use, FileIO, MemorySearch, Shell
 from ....core.op import BaseOp
 from ....core.utils import format_messages
 
 # name + desc + "{working_dir}/skills/{skill_name}/SKILL.md"
 
-_DEFAULT_AGENT_SKILL_INSTRUCTION = (
-        "# Agent Skills\n"
-        "The agent skills are a collection of folds of instructions, scripts, "
-        "and resources that you can load dynamically to improve performance "
-        "on specialized tasks. Each agent skill has a `SKILL.md` file in its "
-        "folder that describes how to use the skill. If you want to use a "
-        "skill, you MUST read its `SKILL.md` file carefully."
-    )
-
-_DEFAULT_AGENT_SKILL_TEMPLATE = """## {name}
-{description}
-Check "{dir}/SKILL.md" for how to use this skill"""
 
 class CliAgent(BaseOp):
     """CLI agent for interactive chat with memory management."""
 
     def __init__(
-            self,
-            working_dir: str,
-            vector_weight: float = 0.7,
-            candidate_multiplier: float = 3.0,
-            context_window_tokens: int = 128000,
-            reserve_tokens: int = 36000,
-            keep_recent_tokens: int = 20000,
-            language: str = "zh",
-            **kwargs,
+        self,
+        working_dir: str,
+        max_iters: int = 50,
+        vector_weight: float = 0.7,
+        candidate_multiplier: float = 3.0,
+        context_window_tokens: int = 128000,
+        reserve_tokens: int = 36000,
+        keep_recent_tokens: int = 20000,
+        language: str = "zh",
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.working_dir: str = working_dir
         Path(self.working_dir).mkdir(parents=True, exist_ok=True)
+        self.max_iters: int = max_iters
         self.vector_weight: float = vector_weight
         self.candidate_multiplier: float = candidate_multiplier
         self.context_window_tokens: int = context_window_tokens
@@ -60,6 +54,84 @@ class CliAgent(BaseOp):
         self.messages: list[Msg] = []
         self.previous_summary: str = ""
         self.summary_tasks: list[asyncio.Task] = []
+
+        # Initialize toolkit
+        self.toolkit = self._create_file_toolkit()
+        self.toolkit.register_tool_function(browser_use)
+        self.toolkit.register_tool_function(execute_python_code)
+        self.toolkit.register_tool_function(self.memory_search)
+        self.toolkit.register_tool_function(self.execute_shell_command)
+
+        # Register agent skills
+        skill_dir = Path(self.working_dir) / "skills"
+        self._download_skills_from_github(skill_dir)
+
+    def _create_file_toolkit(self):
+        """Create a toolkit with file operations."""
+
+        toolkit = Toolkit()
+        file_io = FileIO(working_dir=self.working_dir)
+        toolkit.register_tool_function(file_io.read)
+        toolkit.register_tool_function(file_io.write)
+        toolkit.register_tool_function(file_io.edit)
+
+        return toolkit
+
+    def _find_skills_then_register(self, path: str, target_dir: Path, exist: bool = False) -> None:
+        # Recursively find all directories containing SKILL.md
+        skill_paths = []
+        for root, _, files in os.walk(path):
+            if "SKILL.md" in files:
+                skill_paths.append(Path(root))
+
+        # Copy each skill directory to target
+        for skill_path in skill_paths:
+            dest = target_dir / skill_path.name
+            if not exist:
+                shutil.copytree(skill_path, dest)
+            self.toolkit.register_agent_skill(dest)
+
+        print(f"Successfully downloaded {len(skill_paths)} skills to {str(target_dir)}")
+
+    def _download_skills_from_github(
+        self,
+        skill_dir: str,
+        repo_url: str = "https://github.com/anthropics/skills.git",
+    ) -> None:
+        """
+        Download skills from github repository to the specified path.
+        Args:
+            skill_dir: Target directory to store the skills
+            repo_url: GitHub repository URL (default: anthropics/skills)
+        """
+        target_dir = Path(skill_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # Check if skills directory already exists and is not empty
+        if any(target_dir.iterdir()):
+            logger.info(f"Skill directory {skill_dir} already exists and is not empty. Skipping download.")
+            self._find_skills_then_register(skill_dir, target_dir, True)
+            return
+
+        # Clone to a temporary directory first
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_repo_path = Path(temp_dir) / "skills"
+            try:
+                subprocess.run(
+                    ["git", "clone", "--depth", "1", repo_url, str(temp_repo_path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+                self._find_skills_then_register(temp_repo_path, target_dir)
+            except subprocess.CalledProcessError as e:
+                logger.exception(f"Failed to clone repository: {e}")
+                if e.stderr:
+                    logger.exception(f"Error output: {e.stderr}")
+                raise
+            except Exception as e:
+                logger.exception(f"Error downloading skills: {e}")
+                raise
 
     def add_summary_task(self, messages: list[Msg]):
         """Add summary task to queue."""
@@ -101,17 +173,6 @@ class CliAgent(BaseOp):
             ),
         )
         self.summary_tasks.append(summary_task)
-
-    def _create_file_toolkit(self):
-        """Create a toolkit with file operations."""
-
-        toolkit = Toolkit()
-        file_io = FileIO(working_dir=self.working_dir)
-        toolkit.register_tool_function(file_io.read)
-        toolkit.register_tool_function(file_io.write)
-        toolkit.register_tool_function(file_io.edit)
-
-        return toolkit
 
     async def new(self) -> str:
         """Reset conversation history using summary."""
@@ -246,6 +307,31 @@ class CliAgent(BaseOp):
             ],
         )
 
+    async def execute_shell_command(self, command: str, timeout: int = 60) -> ToolResponse:
+        """Execute given command and return the return code, standard output and
+        error within <returncode></returncode>, <stdout></stdout> and
+        <stderr></stderr> tags.
+
+        Args:
+            command (`str`):
+                The shell command to execute.
+            timeout (`int`, defaults to `60`):
+                The maximum time (in seconds) allowed for the command to run.
+                Default is 60 seconds.
+
+        Returns:
+            `ToolResponse`:
+                The tool response containing the return code, standard output, and
+                standard error of the executed command. If timeout occurs, the
+                return code will be -1 and stderr will contain timeout information.
+        """
+        shell_tool = Shell(working_dir=self.working_dir)
+        shell_result = await shell_tool.execute_shell_command(
+            command=command,
+            timeout=timeout,
+        )
+        return shell_result
+
     async def execute(self):
         """Execute the agent."""
         _ = await self.compact(force_compact=False)
@@ -254,17 +340,14 @@ class CliAgent(BaseOp):
         query = self.context.query
         messages = await self._build_messages(query)
 
-        toolkit = self._create_file_toolkit()
-        # Register memory search tool
-        toolkit.register_tool_function(self.memory_search)
-
         # Create the ReAct agent
         agent = ReActAgent(
             name="reme_cli_agent",
             model=self.as_llm,
             sys_prompt=messages[0].content,  # System prompt
             formatter=self.as_llm_formatter,
-            toolkit=toolkit,
+            toolkit=self.toolkit,
+            max_iters=self.max_iters,
         )
 
         # We disable the terminal printing to avoid messy outputs
@@ -281,8 +364,8 @@ class CliAgent(BaseOp):
         last_text_content = ""
         last_think_content = ""
         async for msg, last in stream_printing_messages(
-                agents=[agent],
-                coroutine_task=agent(self.messages),
+            agents=[agent],
+            coroutine_task=agent(self.messages),
         ):
             # print(msg, last)
             content_blocks = msg.get_content_blocks()
@@ -291,7 +374,7 @@ class CliAgent(BaseOp):
                     if not in_thinking and len(block["thinking"]) > len(last_think_content):
                         print("\033[90m\nThinking: ", end="", flush=True)
                         in_thinking = True
-                    print(block["thinking"][len(last_think_content):], end="", flush=True)
+                    print(block["thinking"][len(last_think_content) :], end="", flush=True)
                     last_think_content = block["thinking"]
                 elif block["type"] == "text":
                     if in_thinking:
@@ -300,7 +383,7 @@ class CliAgent(BaseOp):
                     if not in_answer:
                         print("\nRemy: ", end="", flush=True)
                         in_answer = True
-                    print(block["text"][len(last_text_content):], end="", flush=True)
+                    print(block["text"][len(last_text_content) :], end="", flush=True)
                     last_text_content = block["text"]
                 elif block["type"] == "tool_use":
                     if in_thinking:

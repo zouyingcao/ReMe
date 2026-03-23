@@ -93,6 +93,7 @@ class ReMeCli(Application):
         print(f"ReMe language={language or 'default'}")
 
         cli_agent = CliAgent(
+            max_iters=self.service_config.metadata["max_iters"],
             vector_weight=self.service_config.metadata["vector_weight"],
             candidate_multiplier=self.service_config.metadata["candidate_multiplier"],
             context_window_tokens=self.service_config.metadata["context_window_tokens"],
