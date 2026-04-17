@@ -36,6 +36,7 @@ class CliAgent(BaseOp):
         context_window_tokens: int = 128000,
         reserve_tokens: int = 36000,
         keep_recent_tokens: int = 20000,
+        skills_repo_url: str = "https://github.com/anthropics/skills.git",
         language: str = "zh",
         **kwargs,
     ):
@@ -64,7 +65,7 @@ class CliAgent(BaseOp):
 
         # Register agent skills
         skill_dir = Path(self.working_dir) / "skills"
-        self._download_skills_from_github(skill_dir)
+        self._download_skills_from_github(skill_dir, skills_repo_url)
 
     def _create_file_toolkit(self):
         """Create a toolkit with file operations."""

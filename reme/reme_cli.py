@@ -99,6 +99,7 @@ class ReMeCli(Application):
             context_window_tokens=self.service_config.metadata["context_window_tokens"],
             reserve_tokens=self.service_config.metadata["reserve_tokens"],
             keep_recent_tokens=self.service_config.metadata["keep_recent_tokens"],
+            skills_repo_url=self.service_config.metadata["skills_repo_url"],
             working_dir=self.working_dir,
             language=language,
             **kwargs,

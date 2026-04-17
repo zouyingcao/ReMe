@@ -8,11 +8,12 @@ metadata:
   keep_recent_tokens: 10000
   vector_weight: 0.7
   candidate_multiplier: 2
+  skills_repo_url: https://github.com/zouyingcao/finance-skills.git
 
 as_llms:
   default:
     backend: openai
-    model_name: qwen3.5-plus
+    model_name: glm-5.1
 
 as_llm_formatters:
   default:
