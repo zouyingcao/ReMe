@@ -8,7 +8,7 @@ metadata:
   keep_recent_tokens: 10000
   vector_weight: 0.7
   candidate_multiplier: 2
-  skills_repo_url: https://github.com/zouyingcao/finance-skills.git
+  skills_repo_url: https://github.com/waditu-tushare/skills.git
 
 as_llms:
   default:
